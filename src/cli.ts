@@ -6,7 +6,7 @@ import chalk from "chalk";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { spawn, spawnSync } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { createProxyServer } from "./proxy.js";
 import { isErrnoException, parseHostname } from "./utils.js";
 import { RouteStore } from "./routes.js";
@@ -45,6 +45,25 @@ function readProxyPort(): number {
     return isNaN(port) ? DEFAULT_PROXY_PORT : port;
   } catch {
     return DEFAULT_PROXY_PORT;
+  }
+}
+
+/**
+ * Try to find the PID of a process listening on the given TCP port.
+ * Uses lsof, which is available on macOS and most Linux distributions.
+ * Returns null if the PID cannot be determined.
+ */
+function findPidOnPort(port: number): number | null {
+  try {
+    const output = execSync(`lsof -ti tcp:${port} -sTCP:LISTEN`, {
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    // lsof may return multiple PIDs (one per line); take the first
+    const pid = parseInt(output.trim().split("\n")[0], 10);
+    return isNaN(pid) ? null : pid;
+  } catch {
+    return null;
   }
 }
 
@@ -208,12 +227,44 @@ function startProxyServer(proxyPort: number): void {
 
 async function stopProxy(): Promise<void> {
   const pidPath = store.pidPath;
+  const proxyPort = readProxyPort();
+
   if (!fs.existsSync(pidPath)) {
-    console.log(chalk.yellow("Proxy is not running."));
+    // PID file is missing -- check whether something is still listening
+    if (await isProxyRunning(proxyPort)) {
+      console.log(chalk.yellow(`PID file is missing but port ${proxyPort} is still in use.`));
+      const pid = findPidOnPort(proxyPort);
+      if (pid !== null) {
+        try {
+          process.kill(pid, "SIGTERM");
+          try {
+            fs.unlinkSync(PROXY_PORT_PATH);
+          } catch {
+            // Port file may already be absent; non-fatal
+          }
+          console.log(chalk.green(`Killed process ${pid}. Proxy stopped.`));
+        } catch (err: unknown) {
+          if (isErrnoException(err) && err.code === "EPERM") {
+            console.error(chalk.red("Permission denied. The proxy runs as root."));
+            console.log(chalk.blue("Use: sudo portless proxy stop"));
+          } else {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error(chalk.red("Failed to stop proxy:"), message);
+          }
+        }
+      } else if (process.getuid?.() !== 0) {
+        // Not running as root -- lsof likely cannot see root-owned processes
+        console.error(chalk.red("Permission denied. The proxy likely runs as root."));
+        console.log(chalk.blue("Use: sudo portless proxy stop"));
+      } else {
+        console.error(chalk.red(`Could not identify the process on port ${proxyPort}.`));
+        console.log(chalk.blue(`Try: sudo kill "$(lsof -ti tcp:${proxyPort})"`));
+      }
+    } else {
+      console.log(chalk.yellow("Proxy is not running."));
+    }
     return;
   }
-
-  const proxyPort = readProxyPort();
 
   try {
     const pid = parseInt(fs.readFileSync(pidPath, "utf-8"), 10);
